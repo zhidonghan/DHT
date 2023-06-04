@@ -1,0 +1,458 @@
+package main
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	u "github.com/ipfs/go-ipfs-util"
+	"math/big"
+	"math/bits"
+	"sort"
+)
+
+const (
+	k = 3   // 每个桶中最多存储的节点数
+	b = 160 // 每个节点最多拥有桶的数量
+)
+// 节点结构体
+type Node struct {
+	nodeId *big.Int // 节点ID
+}
+
+// 桶结构体
+type Bucket struct {
+	nodes []*Node // 存储的节点列表
+}
+
+// K_Bucket结构体
+type K_Bucket struct {
+	buckets [b]*Bucket // 160个桶，每个桶对应一个bit位
+}
+
+// Peer结构体
+type Peer struct {
+	localNodeId *big.Int  // 本地节点ID
+	kBucket     *K_Bucket // K_Bucket
+	Keys        [][]byte
+	Value       map[string]string
+}
+
+// 初始化Peer
+func NewPeer(localNodeId *big.Int) *Peer {
+	m := make(map[string]string)
+	return &Peer{
+		localNodeId: localNodeId,
+		kBucket:     NewK_bucket(),
+		Value:       m,
+	}
+}
+func NewK_bucket() *K_Bucket {
+	kb := &K_Bucket{}
+	for i := 0; i < 160; i++ {
+		kb.buckets[i] = &Bucket{}
+	}
+	return kb
+}
+func CommonPrefixLen(a, b []byte) int {
+	return ZeroPrefixLen(u.XOR(a, b))
+}
+func ZeroPrefixLen(id []byte) int {
+	for i, b := range id {
+		if b != 0 {
+			return i*8 + bits.LeadingZeros8(uint8(b))
+		}
+	}
+	return len(id) * 8
+}
+
+// 将节点插入到正确的桶中
+func (kb *K_Bucket) insertNode(localNodeId *big.Int, nodeId *big.Int) {
+	// 计算节点ID与本地节点ID的异或值
+	xorValue := new(big.Int).Xor(nodeId, localNodeId)
+
+	// 计算异或值的最高位
+	highestBit := 159
+	for i := 159; i >= 0; i-- {
+		if xorValue.Bit(i) == 1 {
+			highestBit = i
+			break
+		}
+	}
+	bucket := kb.buckets[highestBit]
+
+	// 如果桶中已经存在该节点，则将其移动到桶的末尾
+	for i, node := range bucket.nodes {
+		if node.nodeId.Cmp(nodeId) == 0 {
+			if i != len(bucket.nodes)-1 {
+				bucket.nodes = append(bucket.nodes[:i], bucket.nodes[i+1:]...)
+				bucket.nodes = append(bucket.nodes, node)
+			}
+			return
+		}
+	}
+
+	// 如果桶中没满，将节点直接插入到对应的桶的末尾
+	if len(bucket.nodes) < k {
+		bucket.nodes = append(bucket.nodes, &Node{nodeId})
+		return
+	}
+
+	oldestNode := bucket.nodes[0]
+	bucket.nodes = bucket.nodes[1:]
+	bucket.nodes = append(bucket.nodes, &Node{nodeId})
+
+	nextBucketIndex := highestBit + 1
+	if nextBucketIndex < b {
+		nextBucket := kb.buckets[nextBucketIndex]
+		if len(nextBucket.nodes) < k {
+			nextBucket.nodes = append(nextBucket.nodes, oldestNode)
+			return
+		}
+
+		kb.insertNode(oldestNode.nodeId, nodeId)
+	}
+}
+
+// 删除节点
+func (kb *K_Bucket) deleteNode(localNodeId *big.Int, nodeId *big.Int) {
+	// 计算节点ID与本地节点ID的异或值
+	xorValue := new(big.Int).Xor(nodeId, localNodeId)
+
+	// 计算异或值的最高位
+	highestBit := 159
+	for i := 159; i >= 0; i-- {
+		if xorValue.Bit(i) == 1 {
+			highestBit = i
+			break
+		}
+	}
+	bucket := kb.buckets[highestBit]
+	for i, node := range bucket.nodes {
+		if node.nodeId.Cmp(nodeId) == 0 {
+			bucket.nodes = append(bucket.nodes[:i], bucket.nodes[i+1:]...)
+			break
+		}
+	}
+}
+
+// 更新节点
+func (kb *K_Bucket) updateNode(localNodeId *big.Int, node *Node) {
+	// 计算节点ID与本地节点ID的异或值
+	xorValue := new(big.Int).Xor(node.nodeId, localNodeId)
+
+	// 计算异或值的最高位
+	highestBit := 159
+	for i := 159; i >= 0; i-- {
+		if xorValue.Bit(i) == 1 {
+			highestBit = i
+			break
+		}
+	}
+	bucket := kb.buckets[highestBit]
+	for i, n := range bucket.nodes {
+		if n.nodeId.Cmp(node.nodeId) == 0 {
+			bucket.nodes[i] = node
+			break
+		}
+	}
+}
+
+// 查找节点
+func (kb *K_Bucket) FindNode(peer *Peer, nodeId *big.Int) bool {
+	// 先执行一次insertNode操作
+	// kb.insertNode(localNodeId, nodeId)
+
+	localNodeId := peer.localNodeId
+
+	// 打印peer桶中所有的节点
+	//fmt.Println("打印peer桶中所有的节点")
+	//peer.kBucket.printBucketContents()
+
+	// 查找自己的桶中是否有该节点
+	isFind := false
+
+	highestBit := 159
+	for i := 159; i >= 0; i-- {
+		if nodeId.Bit(i) != localNodeId.Bit(i) {
+			highestBit = i
+			break
+		}
+	}
+
+	bucket := kb.buckets[highestBit]
+
+	for _, node := range bucket.nodes {
+		if node.nodeId.Cmp(nodeId) == 0 {
+			isFind = true
+			break
+		}
+	}
+	if isFind {
+		return true
+	}
+
+	var selectedNodes []*Node
+	for _, node := range bucket.nodes {
+		if node.nodeId.Cmp(nodeId) != 0 {
+			selectedNodes = append(selectedNodes, node)
+			if len(selectedNodes) == 2 {
+				break
+			}
+		}
+	}
+	for _, node := range selectedNodes {
+		if node.nodeId.Cmp(localNodeId) != 0 {
+			// 发送FindNode(nodeId)操作
+			fmt.Printf("Sending FindNode(%s) to node %s\n", nodeId.String(), node.nodeId.String())
+		}
+	}
+
+	return false
+}
+
+// 打印每个桶中存在的NodeID
+func (kb *K_Bucket) printBucketContents() {
+	for i := 0; i < 160; i++ {
+		bucket := kb.buckets[i]
+		if len(bucket.nodes) > 0 {
+			fmt.Printf("Bucket %d: ", i)
+			fmt.Println()
+			for _, node := range bucket.nodes {
+				fmt.Printf("%s\n", node.nodeId.String())
+			}
+
+		}
+	}
+}
+func (kb *K_Bucket) FindNode2(peer Peer, key []byte) (rNode []string) {
+	d := xorDistance(peer.localNodeId.Bytes(), key)
+	bucketID := d - 1
+	buckets := peer.kBucket.buckets
+	var node1 *Node
+	var node2 *Node
+	if len(buckets[bucketID].nodes) == 0 {
+		return nil
+	} else if len(buckets[bucketID].nodes) < 2 && len(buckets[bucketID].nodes) > 0 {
+		node1 = buckets[bucketID].nodes[0]
+	} else {
+		m := make(map[*big.Int]*big.Int)
+
+		for _, node := range buckets[bucketID].nodes {
+			dis := xorDistance(key, node.nodeId.Bytes())
+			m[node.nodeId] = big.NewInt(int64(dis))
+		}
+		sort.Slice(buckets[bucketID].nodes, func(i, j int) bool {
+			return m[buckets[bucketID].nodes[i].nodeId].Cmp(m[buckets[bucketID].nodes[j].nodeId]) < 0
+		})
+		node1 = buckets[bucketID].nodes[0]
+		node2 = buckets[bucketID].nodes[1]
+	}
+	rNode = append(rNode, node1.nodeId.String(), node2.nodeId.String())
+	return
+}
+// 1. 判断Key是否是Value的hash，如果不是，返回false；
+// 2. 判断当前Peer是否已经保存了这个键值对，如果已经保存，则返回true，否则保存这个键值对，并执第3步；
+// 3. 判断Key距离自己的PeerID的距离，算出这个节点对应的桶，然后从对应的桶⾥选择2
+// 个距离Key最近的节点，再调⽤SetValue(Key, Value)函数，然后返回true。
+func (kb *K_Bucket) SetValue(key, value []byte, peer *Peer) bool {
+	//判断key,value是否相对应
+	hash := sha256.Sum256(value)
+	hashValue := hash[:]
+	isHash := compareHash(hashValue, key)
+	if isHash == false {
+		return false
+	}
+	//是否已经存了该key
+	isExist := false
+	for _, v := range peer.Keys {
+		if compareHash(v, key) == true {
+			isExist = true
+		}
+	}
+	if isExist == true {
+		return true
+	} else {
+		peer.Keys = append(peer.Keys, key)
+		fmt.Printf("peerId:%v,peer的key %v:", peer.localNodeId, peer.Keys)
+		_key := hex.EncodeToString(key)
+		fmt.Println(_key)
+		_value := string(value)
+		fmt.Println(_value)
+
+		peer.Value[_key] = _value
+		fmt.Printf("setvalue:%v", peer.Value[_key])
+		rnode := kb.FindNode2(*peer, key)
+		fmt.Sprintf("距离key%v:最近的两个节点为%v", key, rnode)
+		return true
+	}
+
+	return false
+}
+func (kb *K_Bucket) getValue(key []byte, peer *Peer) (s string) {
+	isExist := false
+	for _, v := range peer.Keys {
+		fmt.Println(v)
+		if compareHash(v, key) == true {
+			isExist = true
+		}
+	}
+	if isExist == true {
+		return peer.Value[hex.EncodeToString(key)]
+	} else {
+		nodes := kb.FindNode2(*peer, key)
+		for _, v := range nodes {
+			var id big.Int
+			id.SetString(v, 10)
+			_value1 := kb.getValue(key, NewPeer(&id))
+			hash := sha256.Sum256([]byte(_value1))
+			hashValue := hash[:]
+			isHash := compareHash(hashValue, key)
+			if isHash == true {
+				return string(hashValue)
+				break
+			}
+		}
+		return
+	}
+
+	return
+}
+func xorDistance(a, b []byte) int {
+	xorValue := new(big.Int).Xor(new(big.Int).SetBytes(a), new(big.Int).SetBytes(b))
+
+	// 计算异或值的最高位
+	highestBit := 159
+	for i := 159; i >= 0; i-- {
+		if xorValue.Bit(i) == 1 {
+			highestBit = i
+			break
+		}
+	}
+
+	return highestBit
+}
+func compareHash(hash []byte, value []byte) bool {
+	if len(hash) != len(value) {
+		return false
+	}
+
+	for i := 0; i < len(hash); i++ {
+		if hash[i] != value[i] {
+			return false
+		}
+	}
+
+	return true
+}
+func gethash(value []byte) []byte {
+	hash := sha256.Sum256(value)
+	hashValue := hash[:]
+	return hashValue
+}
+func main() {
+	//初始化5个Peer
+	var peers []*Peer
+	for i := 0; i < 5; i++ {
+		nodeId := big.NewInt(int64(i))
+		peer := NewPeer(nodeId)
+		peers = append(peers, peer)
+	}
+
+	for i := 0; i < 5; i++ {
+		I := int64(i)
+		nodeId := big.NewInt(I)
+		for j := 0; j < 5; j++ {
+			if i != j {
+				J := int64(j)
+				nodeJd := big.NewInt(J)
+				peers[I].kBucket.insertNode(nodeId, nodeJd)
+			}
+		}
+	}
+
+	//rand.Seed(time.Now().UnixNano())
+	//for i := 0; i < 5; i++ {
+	//	nodeId := big.NewInt(int64(rand.Intn(96) + 5))
+	//	peers[0].kBucket.insertNode(peers[0].localNodeId, NewPeer(nodeId).localNodeId)
+	//}
+	//peers[0].kBucket.printBucketContents()
+
+	fmt.Println("200个新节点加入前")
+	for i, peer := range peers {
+		fmt.Printf("Peer %d:\n", i)
+		peer.kBucket.printBucketContents()
+		fmt.Println()
+	}
+
+	fmt.Println("200新节点加入后")
+	for i := 0; i < 200; i++ {
+		// 生成新的节点
+		max := new(big.Int).Exp(big.NewInt(2), big.NewInt(160), nil)
+		min := big.NewInt(5)
+		nodeId, err := rand.Int(rand.Reader, max.Sub(max.Sub(max, big.NewInt(1)), min))
+		if err != nil {
+			// 处理错误
+			fmt.Println("随机生成大整数错误")
+		}
+		nodeId.Add(nodeId, min)
+		peer := NewPeer(nodeId)
+		peers = append(peers, peer)
+
+		randnode, _ := rand.Int(rand.Reader, new(big.Int).Sub(big.NewInt(4), big.NewInt(0)))
+		localNodeId := randnode
+		addtopeer := peers[randnode.Int64()]
+
+		peer.kBucket.insertNode(nodeId, localNodeId)
+
+		for _, bucket := range addtopeer.kBucket.buckets {
+			if len(bucket.nodes) > 0 {
+				for _, node := range bucket.nodes {
+					peer.kBucket.insertNode(nodeId, node.nodeId)
+				}
+			}
+		}
+
+		addtopeer.kBucket.insertNode(localNodeId, nodeId)
+
+	}
+
+	for i, peer := range peers {
+		fmt.Printf("Peer %d:\n", i)
+		peer.kBucket.printBucketContents()
+		fmt.Println()
+	}
+
+	maxpeer := big.NewInt(159)
+	peerId, _ := rand.Int(rand.Reader, maxpeer)
+	maxId := new(big.Int).Exp(big.NewInt(2), big.NewInt(160), nil)
+	nodeId, _ := rand.Int(rand.Reader, maxId.Sub(maxId, big.NewInt(1)))
+	fmt.Println("在", peerId, "peer节点中查找", nodeId)
+	isFind := peers[peerId.Int64()].kBucket.FindNode(peers[peerId.Int64()], nodeId)
+	if isFind {
+		fmt.Println("成功查找该", nodeId, "在", peerId, "peer节点中")
+	} else {
+		fmt.Println("该", nodeId, "节点不在", peerId, "peer节点中")
+	}
+	byteSlice := [][]byte{
+		[]byte{213, 45, 67, 108, 76, 11, 22, 33},
+		[]byte{12, 87, 67, 91, 33, 99, 23, 17},
+		[]byte{33, 22, 33, 55, 66, 234, 34},
+		[]byte{72, 22, 78, 108, 77},
+		[]byte{45, 101, 88, 108, 88},
+		[]byte{72, 99, 98, 108, 111},
+	}
+	for k, data1 := range byteSlice {
+		key := gethash(data1)
+		fmt.Printf("第 %v个 key值为: %v", k, hex.EncodeToString(key))
+		fmt.Println()
+		fmt.Printf("data值为: %v", string(data1))
+		fmt.Println()
+		bool1 := peers[k].kBucket.SetValue(key, data1, peers[k])
+		fmt.Printf("data1 set: %v", bool1)
+		fmt.Println()
+		fmt.Printf("value:%v", peers[0].Value[string(key)])
+		value := peers[k].kBucket.getValue(key, peers[0])
+		fmt.Printf("取得的value:%v", value)
+		fmt.Println()
+	}
+}
